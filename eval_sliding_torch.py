@@ -6,16 +6,13 @@ Loads a trained model checkpoint and evaluates with overlapping windows.
 Each scored token gets at least (seq_len - stride) context tokens.
 
 Usage:
-    python eval_sliding_torch.py
-    EVAL_STRIDE=64 CHECKPOINT=final_model.pt python eval_sliding_torch.py
-    CHECKPOINT=final_model.int8.ptz python eval_sliding_torch.py
+    EVAL_STRIDE=64 CHECKPOINT=final_model.int8.ptz python eval_sliding_torch.py
 """
 from __future__ import annotations
 
 import io
 import math
 import os
-import sys
 import time
 import zlib
 
@@ -25,13 +22,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-# Import from train_gpt.py
 from train_gpt import (
+    CastedLinear,
     GPT,
     Hyperparameters,
     build_sentencepiece_luts,
     dequantize_state_dict_int8,
     load_validation_tokens,
+    restore_low_dim_params_to_fp32,
 )
 
 
@@ -46,12 +44,7 @@ def eval_sliding(
     device: torch.device,
 ) -> tuple[float, float]:
     """
-    Sliding window evaluation.
-
-    For each window of size seq_len, shifted by stride:
-    - Feed the full window to the model
-    - Only score the LAST `stride` tokens (they have maximal context)
-    - Exception: the very first window scores all seq_len tokens
+    Sliding window evaluation using model.forward_logits().
     """
     n_tokens = val_tokens.numel()
     total_loss_sum = 0.0
@@ -79,37 +72,9 @@ def eval_sliding(
             x = chunk[:-1].reshape(1, seq_len)
             y = chunk[1:].reshape(1, seq_len)
 
-            # Forward: we need per-token losses, not mean
-            # Replicate the GPT forward but get per-token CE
+            # Use model's own forward path to get logits
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                h = model.tok_emb(x)
-                h = F.rms_norm(h, (h.size(-1),))
-                x0 = h
-                dim = h.size(-1)
-
-                for loop_idx in range(model.num_loops):
-                    adaln = model.adaln_params[loop_idx].to(dtype=h.dtype)
-                    scale = adaln[:dim]
-                    shift = adaln[dim:]
-                    h = F.rms_norm(h, (dim,)) * (1.0 + scale[None, None, :]) + shift[None, None, :]
-
-                    skips = []
-                    for bi in range(model.num_encoder_blocks):
-                        h = model.blocks[bi](h, x0)
-                        skips.append(h)
-                    for bi in range(model.num_encoder_blocks, model.num_unique_blocks):
-                        di = bi - model.num_encoder_blocks
-                        if di < model.num_skip_per_cycle and skips:
-                            sw = model.skip_weights[loop_idx, di].to(dtype=h.dtype)
-                            h = h + sw[None, None, :] * skips.pop()
-                        h = model.blocks[bi](h, x0)
-
-                    gate = torch.sigmoid(model.cycle_gates[loop_idx].to(dtype=h.dtype))
-                    h = gate[None, None, :] * h + (1.0 - gate[None, None, :]) * x0
-
-                h = model.final_norm(h).reshape(-1, h.size(-1))
-                logits_proj = F.linear(h, model.tok_emb.weight)
-                logits = model.logit_softcap * torch.tanh(logits_proj / model.logit_softcap)
+                logits = model.forward_logits(x)  # [seq_len, vocab]
 
             # Determine which positions to score
             if start == 0:
@@ -118,9 +83,8 @@ def eval_sliding(
                 score_start = seq_len - stride
 
             score_logits = logits[score_start:]
-            score_targets = y[0, score_start:]
+            score_targets = y.reshape(-1)[score_start:]
 
-            # Per-token cross entropy (sum)
             per_token_ce = F.cross_entropy(
                 score_logits.float(), score_targets, reduction="sum"
             )
@@ -130,8 +94,8 @@ def eval_sliding(
             total_scored_tokens += n_scored
 
             # BPB byte counting
-            prev_ids = x[0, score_start:]
-            tgt_ids = y[0, score_start:]
+            prev_ids = x.reshape(-1)[score_start:]
+            tgt_ids = y.reshape(-1)[score_start:]
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             total_bytes += token_bytes.to(torch.float64).sum().item()
@@ -140,8 +104,11 @@ def eval_sliding(
                 elapsed = time.perf_counter() - t0
                 win_per_sec = (win_idx + 1) / elapsed
                 eta = (total_windows - win_idx - 1) / max(win_per_sec, 1e-9)
+                cur_loss = total_loss_sum / max(total_scored_tokens, 1)
+                cur_bpb = (cur_loss / math.log(2.0)) * (total_scored_tokens / max(total_bytes, 1))
                 print(
                     f"sliding_eval: {win_idx + 1}/{total_windows} "
+                    f"cur_bpb={cur_bpb:.4f} "
                     f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)"
                 )
 
@@ -179,7 +146,7 @@ def main():
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
     print(f"val_tokens: {val_tokens.numel():,}")
 
-    # Create model
+    # Create model — match training init exactly
     model = GPT(
         vocab_size=args.vocab_size,
         num_unique_blocks=args.num_unique_blocks,
@@ -194,6 +161,11 @@ def main():
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
+    # Match training: CastedLinear in fp32, restore small params
+    for module in model.modules():
+        if isinstance(module, CastedLinear):
+            module.float()
+    restore_low_dim_params_to_fp32(model)
 
     # Load checkpoint
     if checkpoint.endswith(".ptz"):
@@ -210,6 +182,16 @@ def main():
 
     model.to(device)
     print(f"model loaded, params={sum(p.numel() for p in model.parameters()):,}")
+
+    # Quick sanity: run model.forward on one batch to verify
+    print("\n--- Sanity check: model.forward on first batch ---")
+    with torch.inference_mode():
+        test_chunk = val_tokens[:seq_len + 1].to(device=device, dtype=torch.int64)
+        test_x = test_chunk[:-1].reshape(1, seq_len)
+        test_y = test_chunk[1:].reshape(1, seq_len)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            test_loss = model(test_x, test_y)
+        print(f"sanity: first-batch loss={test_loss.item():.4f}")
 
     # Baseline eval (no overlap)
     print("\n--- Baseline eval (no overlap) ---")
