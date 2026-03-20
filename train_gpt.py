@@ -98,6 +98,8 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    muon_wd = float(os.environ.get("MUON_WD", 0.0))  # Muon weight decay (0.04 = SOTA, PR #180)
+    swa_every = int(os.environ.get("SWA_EVERY", 0))  # SWA checkpoint interval (50 = SOTA), 0=off
     bpb_loss_alpha = float(os.environ.get("BPB_LOSS_ALPHA", 0.0))  # 0 = standard CE, 0.3 = recommended mix
     quant_bits = int(os.environ.get("QUANT_BITS", 8))  # 8 = int8, 6 = int6 (saves ~25% artifact space)
 
@@ -125,10 +127,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, weight_decay: float = 0.0):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay),
         )
 
     @torch.no_grad()
@@ -174,8 +176,12 @@ class Muon(torch.optim.Optimizer):
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
+            wd = group.get("weight_decay", 0.0)
             curr = 0
             for p in params:
+                # Decoupled weight decay (applied before update, like AdamW)
+                if wd > 0:
+                    p.data.mul_(1.0 - lr * wd)
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
@@ -1099,6 +1105,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.muon_wd,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1192,6 +1199,13 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+
+    # SWA: running average of model weights
+    swa_state: dict[str, Tensor] | None = None
+    swa_count = 0
+    if args.swa_every > 0:
+        log0(f"swa:enabled every={args.swa_every} steps")
+
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1260,6 +1274,17 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        # SWA: accumulate weight average
+        if args.swa_every > 0 and (step + 1) % args.swa_every == 0:
+            sd = base_model.state_dict()
+            if swa_state is None:
+                swa_state = {k: v.detach().clone().float() for k, v in sd.items() if "adapter" not in k}
+            else:
+                for k in swa_state:
+                    if k in sd:
+                        swa_state[k].add_(sd[k].float())
+            swa_count += 1
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1295,6 +1320,12 @@ def main() -> None:
     quant_bits = args.quant_bits
     use_zstd = HAS_ZSTD and quant_bits == 6
     compress_label = "zstd" if use_zstd else "zlib"
+
+    # Apply SWA averaged weights if available
+    if swa_state is not None and swa_count > 0:
+        log0(f"swa:applying average of {swa_count} checkpoints")
+        avg_state = {k: (v / swa_count).to(base_model.state_dict()[k].dtype) for k, v in swa_state.items() if k in base_model.state_dict()}
+        base_model.load_state_dict(avg_state, strict=False)
 
     if master_process:
         # Filter adapter params (zero-initialized, only for TTT — saves ~96KB)
