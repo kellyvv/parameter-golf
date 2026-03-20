@@ -462,6 +462,9 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], quant_bits: int = 8)
     quant_range = 31 if quant_bits == 6 else 127
     # For int6, keep embedding in fp16 (it's dual-use: input embed + output projection)
     fp16_keep_patterns = ("tok_emb.weight",) if quant_bits == 6 else ()
+    # BigramHash embedding needs fp16 precision (quantization destroys fine-grained lookup)
+    if quant_bits == 6:
+        fp16_keep_patterns = fp16_keep_patterns + ("bigram_embed.weight",)
     # Mixed int5/int6: MLP weights use int5 for better zstd compression (PR #180)
     # MLP tensor names contain 'fc' or 'proj' inside block modules but NOT attention tensors
     mlp_patterns = ("mlp.",) if quant_bits == 6 else ()
@@ -908,11 +911,13 @@ class GPT(nn.Module):
         # SmearGate: learned gate blending x[t] with x[t-1] (PR #162)
         self.use_smear_gate = use_smear_gate
         if use_smear_gate:
-            self.smear_gate = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
+            # Init to +3.0 → sigmoid(3)≈0.95 → starts near identity (not 0.5!)
+            self.smear_gate = nn.Parameter(torch.full((model_dim,), 3.0, dtype=torch.float32))
         # BigramHash: hash(tok[t-1], tok[t]) → embedding → project → add (PR #162)
         self.use_bigram_hash = use_bigram_hash
         if use_bigram_hash:
             self.bigram_embed = nn.Embedding(bigram_hash_buckets, bigram_hash_dim)
+            nn.init.normal_(self.bigram_embed.weight, std=0.01)  # small init to avoid loss spikes
             self.bigram_proj = nn.Linear(bigram_hash_dim, model_dim, bias=False)
             self.bigram_proj._zero_init = True
             self.bigram_hash_buckets = bigram_hash_buckets
@@ -1289,8 +1294,17 @@ def main() -> None:
     # SWA: running average of model weights
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
+    # Dynamic SWA min step: only collect from last 30% of training
+    # Prevents averaging during rapid convergence in short runs
+    swa_min_step = 200  # default fallback
     if args.swa_every > 0:
-        log0(f"swa:enabled every={args.swa_every} steps")
+        if max_wallclock_ms is not None:
+            # Estimate total steps from step time
+            est_total_steps = max(int(max_wallclock_ms / 700), 500)  # ~700ms/step estimate
+            swa_min_step = int(est_total_steps * 0.7)
+        else:
+            swa_min_step = int(args.iterations * 0.7)
+        log0(f"swa:enabled every={args.swa_every} steps, min_step={swa_min_step}")
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -1374,7 +1388,7 @@ def main() -> None:
         zero_grad_all()
 
         # SWA: accumulate weight average (only after model has trained sufficiently)
-        if args.swa_every > 0 and step >= 200 and (step + 1) % args.swa_every == 0:
+        if args.swa_every > 0 and step >= swa_min_step and (step + 1) % args.swa_every == 0:
             sd = base_model.state_dict()
             if swa_state is None:
                 swa_state = {k: v.detach().clone().float() for k, v in sd.items() if "adapter" not in k}
