@@ -693,9 +693,9 @@ class CastedLinear(nn.Linear):
         w = self.weight
         # STE QAT: apply fake quantization during training
         if _ste_qat_enabled and self.training:
-            # Detect if this is MLP (int5) or attention (int6) based on layer name
-            # We use the global quant_bits setting; mixed int5/int6 is handled at export
-            w = ste_fake_quantize(w, _ste_qat_quant_bits)
+            # Use per-layer quant bits (5 for MLP, 6 for attention)
+            bits = getattr(self, '_ste_qat_bits', _ste_qat_quant_bits)
+            w = ste_fake_quantize(w, bits)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
 
@@ -817,7 +817,9 @@ class MLP(nn.Module):
         super().__init__()
         hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
+        self.fc._ste_qat_bits = 5  # MLP uses int5 at export
         self.proj = CastedLinear(hidden, dim, bias=False)
+        self.proj._ste_qat_bits = 5  # MLP uses int5 at export
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -992,7 +994,9 @@ class GPT(nn.Module):
             gate = torch.sigmoid(self.cycle_gates[loop_idx].to(dtype=x.dtype))
             x = gate[None, None, :] * x + (1.0 - gate[None, None, :]) * x0
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        x = self.final_norm(x)
+        self._last_hidden = x  # Store for forward_with_adapter
+        x = x.reshape(-1, x.size(-1))
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
@@ -1021,9 +1025,9 @@ class GPT(nn.Module):
     def forward_with_adapter(self, input_ids: Tensor) -> Tensor:
         """Forward pass with adapter head added to logits. For TTT eval."""
         base_logits = self._forward_body(input_ids)
-        # Extract hidden states for adapter by running final_norm again
-        # (cheaper than duplicating the entire forward pass)
-        adapter_logits = self.adapter(base_logits.detach())
+        # Use hidden states (dim=512) stored during _forward_body
+        hidden = self._last_hidden.reshape(-1, self._last_hidden.size(-1))
+        adapter_logits = self.adapter(hidden)
         return base_logits + torch.sigmoid(self.adapter_weight) * adapter_logits
 
 
