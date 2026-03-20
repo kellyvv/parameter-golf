@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 from train_gpt import GPT, Hyperparameters, dequantize_state_dict_int8, build_sentencepiece_luts, load_validation_tokens
 import sentencepiece as spm
-import os, zstandard
+import os, zstandard, io
 
 args = Hyperparameters()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -17,7 +17,7 @@ try:
     raw = zstandard.ZstdDecompressor().decompress(raw)
 except:
     pass
-state = torch.load(torch.io.BytesIO(raw), weights_only=True)
+state = torch.load(io.BytesIO(raw), weights_only=True)
 model = GPT(args).to(device)
 model.load_state_dict(dequantize_state_dict_int8(state), strict=False)
 model.eval()
