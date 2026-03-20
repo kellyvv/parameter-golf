@@ -106,6 +106,8 @@ class Hyperparameters:
     use_bigram_hash = bool(int(os.environ.get("USE_BIGRAM_HASH", "0")))  # BigramHash embedding (PR #162)
     bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 4096))
     bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
+    use_ste_qat = bool(int(os.environ.get("USE_STE_QAT", "0")))  # STE QAT: fake quantization during training
+    ste_qat_start_frac = float(os.environ.get("STE_QAT_START_FRAC", 0.25))  # Start QAT after this fraction of training
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -656,11 +658,43 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+# Global STE QAT state
+_ste_qat_enabled = False
+_ste_qat_quant_bits = 6  # default to int6
+
+def ste_fake_quantize(w: Tensor, quant_bits: int = 6) -> Tensor:
+    """Fake quantize: quantize→dequantize with STE (gradients pass through).
+    
+    During forward: w_hat = dequant(quant(w)), but grad(w_hat) = grad(w).
+    This is achieved by: w_hat = w + (dequant(quant(w)) - w).detach()
+    """
+    qrange = {5: 15, 6: 31, 8: 127}.get(quant_bits, 31)
+    if w.ndim == 2:
+        # Per-row quantization (matches actual export)
+        amax = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
+        scale = amax / qrange
+        w_q = (w / scale).round().clamp(-qrange, qrange)
+        w_hat = w_q * scale
+    else:
+        amax = w.abs().max().clamp_min(1e-8)
+        scale = amax / qrange
+        w_q = (w / scale).round().clamp(-qrange, qrange)
+        w_hat = w_q * scale
+    # STE: forward uses w_hat, backward uses w
+    return w + (w_hat - w).detach()
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight
+        # STE QAT: apply fake quantization during training
+        if _ste_qat_enabled and self.training:
+            # Detect if this is MLP (int5) or attention (int6) based on layer name
+            # We use the global quant_bits setting; mixed int5/int6 is handled at export
+            w = ste_fake_quantize(w, _ste_qat_quant_bits)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1299,6 +1333,19 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        # STE QAT: enable fake quantization after start_frac of training
+        global _ste_qat_enabled, _ste_qat_quant_bits
+        if args.use_ste_qat and not _ste_qat_enabled:
+            if max_wallclock_ms is not None:
+                frac = elapsed_ms / max_wallclock_ms
+            else:
+                frac = step / max(args.iterations, 1)
+            if frac >= args.ste_qat_start_frac:
+                _ste_qat_enabled = True
+                _ste_qat_quant_bits = args.quant_bits
+                log0(f"ste_qat:enabled at step={step} frac={frac:.2f} quant_bits={args.quant_bits}")
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
