@@ -108,9 +108,16 @@ def eval_competition(
     ngram_lambda: float = 0.03,
     match_model: MatchModel | None = None,
     match_lambda: float = 0.0,  # 0 = disabled. Recommended: 0.05 - 0.15
+    mix_mode: str = "linear",  # "linear" or "log" (logarithmic pool)
+    vocab_size: int = 1024,
 ) -> tuple[float, float]:
     """
     Full eval pipeline: sliding window + optional n-gram blending.
+
+    mix_mode:
+      - "linear": P = Σ wᵢ Pᵢ  (standard linear interpolation)
+      - "log":    P ∝ Π Pᵢ^wᵢ  (logarithmic pool / geometric weighted avg)
+        Log pool preserves high-confidence predictions from specialized models.
 
     Returns (val_loss, val_bpb) using the combined prediction.
     """
@@ -131,12 +138,18 @@ def eval_competition(
     use_ngram = ngram is not None and ngram_lambda > 0
     use_match = match_model is not None and match_lambda > 0
     use_blending = use_ngram or use_match
+    use_log_pool = mix_mode == "log"
+
+    # --- Bigram expert (online counting, only in blending mode) ---
+    # bigram_counts[prev_token][next_token] = count
+    bigram_counts: dict[int, dict[int, int]] = {}
+    bigram_total: dict[int, int] = {}  # total count per prev_token
+    use_bigram = use_blending  # bigram is free, always on when blending
 
     # --- Exponential Weights Mixer ---
-    # Models: 0 = neural, 1 = ngram, 2 = match
+    # Models: 0 = neural, 1 = ngram, 2 = match, 3 = bigram
     # Weights update multiplicatively: w_i *= p_i(actual_token) ^ learning_rate
     # This gives O(log K) regret — converges to best model automatically.
-    n_models = 1 + int(use_ngram) + int(use_match)
     model_names = ["neural"]
     # Initialize weights: neural gets remainder, others get their lambda
     mix_w = [1.0]
@@ -148,6 +161,11 @@ def eval_competition(
         model_names.append("match")
         mix_w.append(match_lambda)
         mix_w[0] -= match_lambda
+    if use_bigram:
+        model_names.append("bigram")
+        bigram_init_w = 0.02  # small initial weight for bigram
+        mix_w.append(bigram_init_w)
+        mix_w[0] -= bigram_init_w
     mix_w = [max(w, 0.01) for w in mix_w]  # clamp to avoid zero weights
     w_sum = sum(mix_w)
     mix_w = [w / w_sum for w in mix_w]  # normalize
@@ -158,8 +176,8 @@ def eval_competition(
     mix_weight_history: list[list[float]] = []  # for stats
 
     print(f"eval_competition: {total_windows} windows, seq_len={seq_len}, stride={stride}")
-    print(f"eval_competition: ngram={'ON λ=' + str(ngram_lambda) if use_ngram else 'OFF'}")
-    print(f"eval_competition: match={'ON λ=' + str(match_lambda) if use_match else 'OFF'}")
+    print(f"eval_competition: mix_mode={mix_mode} ngram={'ON λ=' + str(ngram_lambda) if use_ngram else 'OFF'}")
+    print(f"eval_competition: match={'ON λ=' + str(match_lambda) if use_match else 'OFF'} bigram={'ON' if use_bigram else 'OFF'}")
     if use_blending:
         print(f"eval_competition: exponential_weights init={dict(zip(model_names, [f'{w:.3f}' for w in mix_w]))}")
 
@@ -226,11 +244,36 @@ def eval_competition(
                             # No match — use neural as fallback for this slot
                             model_preds.append(neural_probs[j])
 
+                    # Bigram expert
+                    if use_bigram and global_pos > 0:
+                        prev_tok = int(val_tokens[global_pos - 1].item())
+                        if prev_tok in bigram_counts and bigram_total.get(prev_tok, 0) > 0:
+                            bg_probs = torch.full_like(neural_probs[j], 1e-8)
+                            total_c = bigram_total[prev_tok]
+                            for next_tok, cnt in bigram_counts[prev_tok].items():
+                                if 0 <= next_tok < vocab_size:
+                                    bg_probs[next_tok] = cnt / total_c
+                            bg_probs /= bg_probs.sum()  # renormalize
+                            model_preds.append(bg_probs)
+                        else:
+                            # No bigram data — use uniform
+                            model_preds.append(torch.full_like(neural_probs[j], 1.0 / vocab_size))
+                    elif use_bigram:
+                        model_preds.append(torch.full_like(neural_probs[j], 1.0 / vocab_size))
+
                     # Weighted mixture using current exponential weights
-                    mixed = torch.zeros_like(neural_probs[j])
-                    for m_idx, pred in enumerate(model_preds):
-                        mixed += mix_w[m_idx] * pred
-                    combined_probs[j] = mixed
+                    if use_log_pool:
+                        # Logarithmic pool: P ∝ Π Pᵢ^wᵢ = softmax(Σ wᵢ log Pᵢ)
+                        log_combined = torch.zeros_like(neural_probs[j])
+                        for m_idx, pred in enumerate(model_preds):
+                            log_combined += mix_w[m_idx] * torch.log(torch.clamp(pred, min=1e-30))
+                        combined_probs[j] = F.softmax(log_combined, dim=-1)
+                    else:
+                        # Linear pool: P = Σ wᵢ Pᵢ
+                        mixed = torch.zeros_like(neural_probs[j])
+                        for m_idx, pred in enumerate(model_preds):
+                            mixed += mix_w[m_idx] * pred
+                        combined_probs[j] = mixed
 
                 combined_log_probs = torch.log(torch.clamp(combined_probs, min=1e-30))
 
@@ -259,7 +302,7 @@ def eval_competition(
             total_bytes += token_bytes.to(torch.float64).sum().item()
 
             # Update n-gram, match model, AND exponential weights with revealed tokens
-            if use_ngram or use_match:
+            if use_blending:
                 new_start = max(ngram_tokens_updated, start + score_start + 1)
                 new_end = start + seq_len + 1
                 if new_end > new_start:
@@ -296,6 +339,17 @@ def eval_competition(
                             else:
                                 model_scores.append(max(neural_score, 1e-10))
 
+                        # Bigram score
+                        if use_bigram and global_pos > 0:
+                            prev_tok = int(val_tokens[global_pos - 1].item())
+                            if prev_tok in bigram_counts and bigram_total.get(prev_tok, 0) > 0:
+                                bg_score = bigram_counts[prev_tok].get(tok, 0) / bigram_total[prev_tok]
+                                model_scores.append(max(bg_score, 1e-10))
+                            else:
+                                model_scores.append(1e-10)  # no data, uniform-ish
+                        elif use_bigram:
+                            model_scores.append(1e-10)
+
                         # Multiplicative weight update: w_i *= p_i(actual)^lr
                         for m_idx in range(len(mix_w)):
                             mix_w[m_idx] *= model_scores[m_idx] ** mix_lr
@@ -313,6 +367,14 @@ def eval_competition(
                             ngram.update_token(history)
                         if use_match:
                             match_model.update(tok)
+                        # Update bigram counts
+                        if use_bigram and global_pos > 0:
+                            prev_tok = int(val_tokens[global_pos - 1].item())
+                            if prev_tok not in bigram_counts:
+                                bigram_counts[prev_tok] = {}
+                                bigram_total[prev_tok] = 0
+                            bigram_counts[prev_tok][tok] = bigram_counts[prev_tok].get(tok, 0) + 1
+                            bigram_total[prev_tok] += 1
                     ngram_tokens_updated = new_end
 
                     # Log weight snapshot periodically
@@ -376,6 +438,7 @@ def main():
     match_lambda = float(os.environ.get("MATCH_LAMBDA", 0.1))
     match_min_order = int(os.environ.get("MATCH_MIN_ORDER", 4))
     match_max_order = int(os.environ.get("MATCH_MAX_ORDER", 12))
+    mix_mode = os.environ.get("MIX_MODE", "linear")  # "linear" or "log"
     disable_ngram = os.environ.get("DISABLE_NGRAM", "0") == "1"
     disable_sliding = os.environ.get("DISABLE_SLIDING", "0") == "1"
     disable_match = os.environ.get("DISABLE_MATCH", "0") == "1"
@@ -392,6 +455,7 @@ def main():
     print(f"  stride:      {stride}")
     print(f"  ngram:       {'OFF' if disable_ngram else f'ON (order={ngram_order}, λ={ngram_lambda}, α={ngram_alpha})'}")
     print(f"  match:       {'OFF' if disable_match else f'ON (order={match_min_order}-{match_max_order}, λ={match_lambda})'}")
+    print(f"  mix_mode:    {mix_mode}")
     print(f"  device:      {device}")
     print()
 
@@ -437,6 +501,7 @@ def main():
         device=device,
         ngram=None, ngram_lambda=0,
         match_model=None, match_lambda=0,
+        mix_mode="linear", vocab_size=args.vocab_size,
     )
     print(f"  baseline: val_loss={bl_loss:.4f} val_bpb={bl_bpb:.4f}")
     print()
@@ -452,6 +517,7 @@ def main():
             device=device,
             ngram=None, ngram_lambda=0,
             match_model=None, match_lambda=0,
+            mix_mode="linear", vocab_size=args.vocab_size,
         )
         print(f"  sliding:  val_loss={sw_loss:.4f} val_bpb={sw_bpb:.4f}")
         print(f"  delta:    {sw_bpb - bl_bpb:+.4f} ({(sw_bpb - bl_bpb) / bl_bpb * 100:+.2f}%)")
@@ -469,6 +535,7 @@ def main():
             device=device,
             ngram=ngram, ngram_lambda=ngram_lambda,
             match_model=None, match_lambda=0,
+            mix_mode=mix_mode, vocab_size=args.vocab_size,
         )
         print(f"  +ngram:   val_loss={ng_loss:.4f} val_bpb={ng_bpb:.4f}")
         print(f"  delta:    {ng_bpb - bl_bpb:+.4f} ({(ng_bpb - bl_bpb) / bl_bpb * 100:+.2f}%)")
@@ -489,6 +556,7 @@ def main():
             device=device,
             ngram=None, ngram_lambda=0,
             match_model=mm_fresh, match_lambda=match_lambda,
+            mix_mode=mix_mode, vocab_size=args.vocab_size,
         )
         print(f"  +match:   val_loss={mm_loss:.4f} val_bpb={mm_bpb:.4f}")
         print(f"  delta:    {mm_bpb - bl_bpb:+.4f} ({(mm_bpb - bl_bpb) / bl_bpb * 100:+.2f}%)")
@@ -510,9 +578,31 @@ def main():
             device=device,
             ngram=ngram_full, ngram_lambda=ngram_lambda,
             match_model=mm_full, match_lambda=match_lambda,
+            mix_mode=mix_mode, vocab_size=args.vocab_size,
         )
         print(f"  FULL:     val_loss={full_loss:.4f} val_bpb={full_bpb:.4f}")
         print(f"  delta:    {full_bpb - bl_bpb:+.4f} ({(full_bpb - bl_bpb) / bl_bpb * 100:+.2f}%)")
+        print()
+
+    # --- Run 6: Log pool comparison (if not already using log) ---
+    if ngram is not None and mm is not None and mix_mode == "linear":
+        print(f"--- LOG POOL: sliding + ngram + match + bigram (log mix) ---")
+        ngram_log = SparseNgramPredictor(vocab_size=args.vocab_size, max_order=ngram_order)
+        mm_log = MatchModel(vocab_size=args.vocab_size, min_order=match_min_order, max_order=match_max_order)
+        log_loss, log_bpb = eval_competition(
+            model, val_tokens, seq_len, stride=stride,
+            base_bytes_lut=base_bytes_lut,
+            has_leading_space_lut=has_leading_space_lut,
+            is_boundary_token_lut=is_boundary_token_lut,
+            device=device,
+            ngram=ngram_log, ngram_lambda=ngram_lambda,
+            match_model=mm_log, match_lambda=match_lambda,
+            mix_mode="log", vocab_size=args.vocab_size,
+        )
+        print(f"  LOG POOL: val_loss={log_loss:.4f} val_bpb={log_bpb:.4f}")
+        print(f"  delta:    {log_bpb - bl_bpb:+.4f} ({(log_bpb - bl_bpb) / bl_bpb * 100:+.2f}%)")
+        if ngram is not None and mm is not None:
+            print(f"  vs linear: {log_bpb - full_bpb:+.6f}")
         print()
 
     # --- Summary ---
@@ -528,6 +618,8 @@ def main():
         print(f"  + Sliding + Match:       {mm_bpb:.6f} ({mm_bpb - bl_bpb:+.6f})")
     if ngram is not None and mm is not None:
         print(f"  + FULL (all combined):   {full_bpb:.6f} ({full_bpb - bl_bpb:+.6f})")
+    if ngram is not None and mm is not None and mix_mode == "linear":
+        print(f"  + LOG POOL:              {log_bpb:.6f} ({log_bpb - bl_bpb:+.6f})")
 
 
 if __name__ == "__main__":
