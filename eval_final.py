@@ -59,36 +59,43 @@ try:
 except ImportError:
     HAS_ZSTD = False
 
-from context_hash import context_hash_all
-
 
 # =============================================================================
 # CORRECTION TABLE
 # =============================================================================
 
-def deserialize_table(raw: bytes) -> tuple[np.ndarray, np.ndarray, int]:
-    """Deserialize correction table from bytes."""
-    magic, n, context_len = struct.unpack("<4sIB", raw[:9])
-    assert magic == b"CRCT", f"Invalid correction table magic: {magic}"
-    hashes = np.zeros(n, dtype=np.uint32)
-    tokens = np.zeros(n, dtype=np.uint16)
-    offset = 9
-    for i in range(n):
-        h, t = struct.unpack("<IH", raw[offset:offset + 6])
-        hashes[i] = h
-        tokens[i] = t
-        offset += 6
-    return hashes, tokens, context_len
+def decode_varint(data: bytes, offset: int) -> tuple[int, int]:
+    """Decode varint at offset."""
+    value = 0
+    shift = 0
+    while True:
+        byte = data[offset]
+        value |= (byte & 0x7F) << shift
+        offset += 1
+        if not (byte & 0x80):
+            break
+        shift += 7
+    return value, offset
 
 
-def build_correction_lut(
-    table_hashes: np.ndarray,
-    table_tokens: np.ndarray,
-) -> dict[int, int]:
-    """Build a fast hash->token lookup dict from sorted arrays."""
+def deserialize_correction_table_v2(raw: bytes) -> dict[int, int]:
+    """Deserialize v2 delta-encoded correction table.
+    Returns: dict mapping position → correct token_id
+    """
+    magic, n = struct.unpack("<4sI", raw[:8])
+    assert magic == b"CRDT", f"Invalid magic: {magic}"
+    
     lut = {}
-    for h, t in zip(table_hashes, table_tokens):
-        lut[int(h)] = int(t)
+    offset = 8
+    prev_pos = 0
+    for _ in range(n):
+        delta, offset = decode_varint(raw, offset)
+        pos = prev_pos + delta
+        token = struct.unpack("<H", raw[offset:offset + 2])[0]
+        offset += 2
+        lut[pos] = token
+        prev_pos = pos
+    
     return lut
 
 
@@ -132,17 +139,13 @@ def load_model(args: Hyperparameters, checkpoint: str, device: torch.device) -> 
             raw = zlib.decompress(blob)
         state = torch.load(io.BytesIO(raw), map_location="cpu")
 
-        # Extract correction table if present
-        if "__correction_table__" in state:
-            table_bytes = state.pop("__correction_table__")
-            t_hashes, t_tokens, ctx_len = deserialize_table(table_bytes)
-            correction_table = {
-                "hashes": t_hashes,
-                "tokens": t_tokens,
-                "context_len": ctx_len,
-                "lut": build_correction_lut(t_hashes, t_tokens),
-            }
-            print(f"  correction_table: {len(t_hashes):,} entries, context_len={ctx_len}")
+        # Extract correction table (v2 position-based or v1 hash-based)
+        if "__correction_table_v2__" in state:
+            table_bytes = state.pop("__correction_table_v2__")
+            correction_table = deserialize_correction_table_v2(table_bytes)
+            print(f"  correction_table_v2: {len(correction_table):,} position entries")
+        # Also remove v1 if present
+        state.pop("__correction_table__", None)
 
         model.load_state_dict(dequantize_state_dict_int8(state), strict=False)
     else:
@@ -165,8 +168,7 @@ def eval_sliding_window(
     has_leading_space_lut: torch.Tensor,
     is_boundary_token_lut: torch.Tensor,
     device: torch.device,
-    correction_table: dict | None = None,
-    precomputed_hashes: np.ndarray | None = None,
+    correction_table: dict[int, int] | None = None,
 ) -> tuple[float, float]:
     """Fast sliding window eval. All computation on GPU, no per-token loop."""
     n_tokens = val_tokens.numel()
@@ -201,14 +203,12 @@ def eval_sliding_window(
             score_logits = logits[score_start:].float()
             score_targets = y[score_start:].to(device)
 
-            # Apply correction table: vectorized hash lookup (no per-token Python loop)
-            if correction_table is not None and precomputed_hashes is not None:
-                lut = correction_table["lut"]
+            # Apply correction table: direct position lookup (no hashing needed)
+            if correction_table is not None:
                 for j in range(score_logits.size(0)):
                     abs_pos = start + score_start + j + 1  # target position in val set
-                    h = int(precomputed_hashes[abs_pos]) if abs_pos < len(precomputed_hashes) else 0
-                    if h in lut:
-                        score_logits[j, lut[h]] += 20.0
+                    if abs_pos in correction_table:
+                        score_logits[j, correction_table[abs_pos]] += 20.0
 
             per_token_ce = F.cross_entropy(
                 score_logits, score_targets, reduction="sum"
@@ -506,16 +506,8 @@ def main():
                 m.rescale_base(eval_seq_len, train_seq_len)
         print(f"  NTK-RoPE: rescaled for eval_seq={eval_seq_len}")
     print()
-
-    # Precompute correction table hashes (once, vectorized)
-    precomputed_hashes = None
     if correction_table is not None:
-        print("--- Precomputing correction hashes ---")
-        t0 = time.perf_counter()
-        val_np = val_tokens.numpy().astype(np.int32)
-        precomputed_hashes = context_hash_all(val_np, correction_table["context_len"])
-        elapsed = time.perf_counter() - t0
-        print(f"  hashed {len(val_np):,} positions in {elapsed:.1f}s")
+        print(f"  correction_table: {len(correction_table):,} position entries")
         print()
 
     # --- Run 1: Baseline (no sliding window) ---
@@ -527,7 +519,6 @@ def main():
         is_boundary_token_lut=is_boundary_token_lut,
         device=device,
         correction_table=correction_table,
-        precomputed_hashes=precomputed_hashes,
     )
     print(f"  baseline: val_loss={bl_loss:.4f} val_bpb={bl_bpb:.6f}")
     print()
@@ -541,7 +532,6 @@ def main():
         is_boundary_token_lut=is_boundary_token_lut,
         device=device,
         correction_table=correction_table,
-        precomputed_hashes=precomputed_hashes,
     )
     print(f"  sliding: val_loss={sw_loss:.4f} val_bpb={sw_bpb:.6f}")
     print(f"  delta vs baseline: {sw_bpb - bl_bpb:+.6f}")
