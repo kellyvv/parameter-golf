@@ -694,6 +694,13 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        # TTT adapter head: tiny MLP for test-time adaptation (96K params)
+        self.adapter = nn.Sequential(
+            nn.Linear(model_dim, 64, bias=False),
+            nn.ReLU(),
+            nn.Linear(64, vocab_size, bias=False),
+        )
+        self.adapter_weight = nn.Parameter(torch.tensor(0.0))  # sigmoid-gated scalar
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -702,6 +709,9 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+        # Zero-init adapter so it starts as a no-op
+        nn.init.zeros_(self.adapter[0].weight)
+        nn.init.zeros_(self.adapter[2].weight)
 
     def _forward_body(self, input_ids: Tensor) -> Tensor:
         """Shared forward body: returns softcapped logits [batch*seq_len, vocab]."""
@@ -751,6 +761,37 @@ class GPT(nn.Module):
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Returns per-token logits [batch*seq_len, vocab] for sliding window eval."""
         return self._forward_body(input_ids)
+
+    def forward_with_adapter(self, input_ids: Tensor) -> Tensor:
+        """Forward pass with adapter head added to logits. For TTT eval."""
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        dim = x.size(-1)
+        for loop_idx in range(self.num_loops):
+            adaln = self.adaln_params[loop_idx].to(dtype=x.dtype)
+            scale, shift = adaln[:dim], adaln[dim:]
+            x = F.rms_norm(x, (dim,)) * (1.0 + scale[None, None, :]) + shift[None, None, :]
+            skips: list[Tensor] = []
+            for bi in range(self.num_encoder_blocks):
+                x = self.blocks[bi](x, x0)
+                skips.append(x)
+            for bi in range(self.num_encoder_blocks, self.num_unique_blocks):
+                di = bi - self.num_encoder_blocks
+                if di < self.num_skip_per_cycle and skips:
+                    sw = self.skip_weights[loop_idx, di].to(dtype=x.dtype)
+                    x = x + sw[None, None, :] * skips.pop()
+                x = self.blocks[bi](x, x0)
+            gate = torch.sigmoid(self.cycle_gates[loop_idx].to(dtype=x.dtype))
+            x = gate[None, None, :] * x + (1.0 - gate[None, None, :]) * x0
+        hidden = self.final_norm(x).reshape(-1, x.size(-1))
+        if self.tie_embeddings:
+            logits_proj = F.linear(hidden, self.tok_emb.weight)
+        else:
+            logits_proj = self.lm_head(hidden)
+        base_logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        adapter_logits = self.adapter(hidden)
+        return base_logits + torch.sigmoid(self.adapter_weight) * adapter_logits
 
 
 # -----------------------------
