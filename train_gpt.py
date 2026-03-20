@@ -820,10 +820,9 @@ class MLP(nn.Module):
         super().__init__()
         hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
-        self.fc._ste_qat_bits = 5  # MLP uses int5 at export
         self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._ste_qat_bits = 5  # MLP uses int5 at export
         self.proj._zero_init = True
+        # _ste_qat_bits set externally by main() only when USE_MIXED_QUANT=1
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
